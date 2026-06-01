@@ -1,0 +1,42 @@
+# Data - never commit raw or processed data
+data/
+*.csv
+*.parquet
+*.feather
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+env/
+.env
+*.egg-info/
+dist/
+build/
+
+# Serialized models
+*.pkl
+*.joblib
+models/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MLflow
+mlruns/
+mlartifacts/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
