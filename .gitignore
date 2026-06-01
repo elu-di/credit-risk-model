@@ -40,3 +40,8 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Coverage and MLflow runtime files
+.coverage
+coverage.xml
+mlflow.db
