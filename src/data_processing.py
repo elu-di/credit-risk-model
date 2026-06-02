@@ -3,19 +3,21 @@ data_processing.py
 ------------------
 Full feature engineering pipeline for the Xente eCommerce transaction dataset.
 
-Pipeline steps:
-  1. Load raw transaction data
-  2. Extract time-based features (hour, day, month, year)
-  3. Compute aggregate customer features (total, avg, std, count)
-  4. Encode categorical variables (One-Hot Encoding)
-  5. Handle missing values (median imputation)
-  6. Normalize numerical features (StandardScaler)
-  7. Compute RFM metrics per customer
-  8. Assign proxy default label via K-Means clustering (is_high_risk)
-  9. Save processed dataset to data/processed/
+Task 3 deliverable: A single fitted sklearn Pipeline object that transforms
+raw transaction data into a model-ready customer-level feature matrix.
 
-Basel II note: All transformations are deterministic and logged so the
-feature pipeline can be audited and reproduced.
+Pipeline steps:
+  1. Extract time-based features (hour, day, month, year, is_night)
+  2. Compute aggregate customer features (total, avg, std, count per customer)
+  3. Encode categorical variables (One-Hot Encoding)
+  4. Handle missing values (median imputation for numerical, mode for categorical)
+  5. Normalize/Standardize numerical features (StandardScaler)
+  6. Compute RFM metrics per customer
+  7. Assign proxy default label via K-Means clustering (is_high_risk)
+  8. Save processed dataset to data/processed/
+
+Basel II note: All transformations are deterministic, seeded, and logged
+so the feature pipeline can be audited and reproduced.
 """
 
 import logging
@@ -23,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.cluster import KMeans
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -41,7 +44,66 @@ RANDOM_SEED = 42
 
 
 # ---------------------------------------------------------------------------
-# 1. Load
+# Custom transformers (sklearn-compatible)
+# ---------------------------------------------------------------------------
+
+class TimeFeatureExtractor(BaseEstimator, TransformerMixin):
+    """
+    Extract temporal features from TransactionStartTime.
+
+    Adds: TransactionHour, TransactionDay, TransactionMonth,
+          TransactionYear, IsNight
+    """
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        ts = pd.to_datetime(X["TransactionStartTime"])
+        X["TransactionHour"] = ts.dt.hour
+        X["TransactionDay"] = ts.dt.day
+        X["TransactionMonth"] = ts.dt.month
+        X["TransactionYear"] = ts.dt.year
+        X["IsNight"] = ((ts.dt.hour >= 22) | (ts.dt.hour <= 5)).astype(int)
+        return X
+
+
+class CustomerAggregator(BaseEstimator, TransformerMixin):
+    """
+    Aggregate transaction-level data to customer-level features.
+
+    Produces one row per CustomerId with:
+      - TotalTransactionAmount, AvgTransactionAmount, TransactionCount,
+        StdTransactionAmount, FraudRate, UniqueProducts, UniqueChannels,
+        NightTxnRatio
+    """
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        if "IsNight" not in X.columns:
+            ts = pd.to_datetime(X["TransactionStartTime"])
+            X["IsNight"] = ((ts.dt.hour >= 22) | (ts.dt.hour <= 5)).astype(int)
+
+        agg = X.groupby("CustomerId").agg(
+            TotalTransactionAmount=("Amount", "sum"),
+            AvgTransactionAmount=("Amount", "mean"),
+            TransactionCount=("TransactionId", "count"),
+            StdTransactionAmount=("Amount", "std"),
+            FraudRate=("FraudResult", "mean"),
+            UniqueProducts=("ProductId", "nunique"),
+            UniqueChannels=("ChannelId", "nunique"),
+            NightTxnRatio=("IsNight", "mean"),
+        )
+        agg["StdTransactionAmount"] = agg["StdTransactionAmount"].fillna(0)
+        return agg.reset_index()
+
+
+# ---------------------------------------------------------------------------
+# Standalone helper functions (used by EDA notebook and tests)
 # ---------------------------------------------------------------------------
 
 def load_raw_data(filename: str = "data.csv") -> pd.DataFrame:
@@ -53,21 +115,8 @@ def load_raw_data(filename: str = "data.csv") -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# 2. Time feature extraction
-# ---------------------------------------------------------------------------
-
 def extract_time_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Extract temporal features from TransactionStartTime.
-
-    Added columns:
-      - TransactionHour:  hour of day (0-23)
-      - TransactionDay:   day of month (1-31)
-      - TransactionMonth: month (1-12)
-      - TransactionYear:  year
-      - IsNight:          1 if hour between 22-05, else 0
-    """
+    """Extract temporal features from TransactionStartTime."""
     df = df.copy()
     df["TransactionHour"] = df["TransactionStartTime"].dt.hour
     df["TransactionDay"] = df["TransactionStartTime"].dt.day
@@ -78,19 +127,13 @@ def extract_time_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------------------
-# 3. RFM feature engineering
-# ---------------------------------------------------------------------------
-
 def compute_rfm(df: pd.DataFrame, snapshot_date: pd.Timestamp | None = None) -> pd.DataFrame:
     """
     Compute Recency, Frequency, and Monetary features per customer.
 
-    - Recency:   days since last transaction (lower = more recent = better)
+    - Recency:   days since last transaction
     - Frequency: number of transactions
-    - Monetary:  total transaction amount (positive debits only)
-
-    Returns a DataFrame indexed by CustomerId.
+    - Monetary:  total debit transaction amount
     """
     if snapshot_date is None:
         snapshot_date = df["TransactionStartTime"].max() + pd.Timedelta(days=1)
@@ -107,24 +150,8 @@ def compute_rfm(df: pd.DataFrame, snapshot_date: pd.Timestamp | None = None) -> 
     return rfm
 
 
-# ---------------------------------------------------------------------------
-# 4. Aggregate customer features
-# ---------------------------------------------------------------------------
-
 def compute_aggregate_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Derive additional customer-level aggregate features.
-
-    Features:
-      - TotalTransactionAmount:  sum of all transaction amounts
-      - AvgTransactionAmount:    mean transaction amount
-      - TransactionCount:        number of transactions
-      - StdTransactionAmount:    std dev of transaction amounts
-      - FraudRate:               fraction of transactions flagged as fraud
-      - UniqueProducts:          number of distinct products purchased
-      - UniqueChannels:          number of distinct channels used
-      - NightTxnRatio:           fraction of transactions between 22:00-05:00
-    """
+    """Derive customer-level aggregate features from transaction history."""
     df = df.copy()
     df["Hour"] = df["TransactionStartTime"].dt.hour
     df["IsNight"] = ((df["Hour"] >= 22) | (df["Hour"] <= 5)).astype(int)
@@ -144,22 +171,14 @@ def compute_aggregate_features(df: pd.DataFrame) -> pd.DataFrame:
     return agg
 
 
-# ---------------------------------------------------------------------------
-# 5. Proxy default label via RFM clustering (is_high_risk)
-# ---------------------------------------------------------------------------
-
 def assign_high_risk_label(rfm: pd.DataFrame, n_clusters: int = 3) -> pd.DataFrame:
     """
-    Assign a binary proxy default label using K-Means clustering on RFM scores.
+    Assign binary proxy default label using K-Means clustering on RFM scores.
 
-    Methodology:
-      - Scale RFM features to zero mean / unit variance
-      - Cluster customers into n_clusters groups
-      - Rank clusters by composite risk score:
-          high Recency + low Frequency + low Monetary → high risk
-      - The highest-risk cluster is labelled is_high_risk=1, others 0
+    The cluster with highest Recency + lowest Frequency + lowest Monetary
+    is labelled is_high_risk=1 (proxy for credit default risk).
 
-    Returns rfm DataFrame with added columns: Cluster, RiskScore, is_high_risk
+    Returns rfm DataFrame with Cluster, RiskScore, is_high_risk columns.
     """
     features = ["Recency", "Frequency", "Monetary"]
     scaler = StandardScaler()
@@ -170,7 +189,9 @@ def assign_high_risk_label(rfm: pd.DataFrame, n_clusters: int = 3) -> pd.DataFra
     rfm["Cluster"] = kmeans.fit_predict(X_scaled)
 
     cluster_stats = rfm.groupby("Cluster")[features].mean()
-    norm = (cluster_stats - cluster_stats.min()) / (cluster_stats.max() - cluster_stats.min() + 1e-9)
+    norm = (cluster_stats - cluster_stats.min()) / (
+        cluster_stats.max() - cluster_stats.min() + 1e-9
+    )
     cluster_stats["RiskScore"] = norm["Recency"] - norm["Frequency"] - norm["Monetary"]
 
     riskiest_cluster = cluster_stats["RiskScore"].idxmax()
@@ -183,24 +204,26 @@ def assign_high_risk_label(rfm: pd.DataFrame, n_clusters: int = 3) -> pd.DataFra
     rfm["RiskScore"] = rfm["Cluster"].map(cluster_stats["RiskScore"])
     rfm["is_high_risk"] = (rfm["Cluster"] == riskiest_cluster).astype(int)
 
-    default_rate = rfm["is_high_risk"].mean()
-    logger.info("Proxy high-risk rate: %.2f%%", default_rate * 100)
+    logger.info("Proxy high-risk rate: %.2f%%", rfm["is_high_risk"].mean() * 100)
     return rfm
 
 
 # ---------------------------------------------------------------------------
-# 6. sklearn Pipeline for numerical + categorical features
+# sklearn Pipeline builder (Task 3 deliverable)
 # ---------------------------------------------------------------------------
 
-def build_sklearn_pipeline(numerical_features: list, categorical_features: list) -> Pipeline:
+def build_preprocessing_pipeline(
+    numerical_features: list,
+    categorical_features: list,
+) -> Pipeline:
     """
-    Build a sklearn ColumnTransformer pipeline that:
-      - Imputes missing numerical values with median
-      - Scales numerical features with StandardScaler
-      - Imputes missing categorical values with most frequent
-      - One-Hot Encodes categorical features
+    Build a sklearn Pipeline for preprocessing customer-level features.
 
-    Returns a fitted-ready sklearn Pipeline.
+    Steps:
+      - Numerical: median imputation → StandardScaler
+      - Categorical: mode imputation → OneHotEncoder
+
+    Returns an unfitted Pipeline ready for fit_transform().
     """
     numerical_pipeline = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -212,44 +235,52 @@ def build_sklearn_pipeline(numerical_features: list, categorical_features: list)
         ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
     ])
 
-    preprocessor = ColumnTransformer([
-        ("num", numerical_pipeline, numerical_features),
-        ("cat", categorical_pipeline, categorical_features),
-    ])
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numerical_pipeline, numerical_features),
+            ("cat", categorical_pipeline, categorical_features),
+        ],
+        remainder="drop",
+    )
 
-    pipeline = Pipeline([
-        ("preprocessor", preprocessor),
-    ])
-
-    return pipeline
+    return Pipeline([("preprocessor", preprocessor)])
 
 
 # ---------------------------------------------------------------------------
-# 7. Build full feature matrix
+# Full feature matrix builder
 # ---------------------------------------------------------------------------
 
 def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Combine RFM, aggregate features, and proxy label into a model-ready DataFrame.
-    Saves the result to data/processed/features.csv.
+    End-to-end pipeline: raw transactions → model-ready customer feature matrix.
 
-    Returns a DataFrame with:
-      - Customer-level features (RFM + aggregates)
-      - is_high_risk target column
+    Steps:
+      1. Extract time features at transaction level
+      2. Compute RFM per customer
+      3. Assign is_high_risk proxy label via K-Means
+      4. Compute aggregate customer features
+      5. Merge all features into one DataFrame
+      6. Save to data/processed/features.csv
+
+    Returns a DataFrame with one row per customer and all engineered features.
     """
-    # Extract time features at transaction level
+    logger.info("Building feature matrix from %d transactions", len(df))
+
+    # Step 1: time features
     df = extract_time_features(df)
 
-    # Compute customer-level features
+    # Step 2 & 3: RFM + proxy label
     rfm = compute_rfm(df)
-    rfm_with_labels = assign_high_risk_label(rfm)
+    rfm_labeled = assign_high_risk_label(rfm)
+
+    # Step 4: aggregate features
     agg = compute_aggregate_features(df)
 
-    # Merge all features
-    features = rfm_with_labels.join(agg, how="left")
+    # Step 5: merge
+    features = rfm_labeled.join(agg, how="left")
     features = features.reset_index()
 
-    # Save processed dataset
+    # Save
     PROCESSED_DATA_PATH.mkdir(parents=True, exist_ok=True)
     out_path = PROCESSED_DATA_PATH / "features.csv"
     features.to_csv(out_path, index=False)
@@ -264,6 +295,22 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
 if __name__ == "__main__":
     raw_df = load_raw_data()
     feature_df = build_feature_matrix(raw_df)
+
     print(feature_df.head())
-    print("\nHigh-risk rate:", feature_df["is_high_risk"].mean().round(4))
-    print("Columns:", list(feature_df.columns))
+    print(f"\nShape: {feature_df.shape}")
+    print(f"High-risk rate: {feature_df['is_high_risk'].mean():.4f}")
+    print(f"Columns: {list(feature_df.columns)}")
+
+    # Demonstrate the sklearn preprocessing pipeline on the feature matrix
+    numerical_cols = [
+        "Recency", "Frequency", "Monetary",
+        "TotalTransactionAmount", "AvgTransactionAmount",
+        "TransactionCount", "StdTransactionAmount",
+        "FraudRate", "UniqueProducts", "UniqueChannels", "NightTxnRatio",
+    ]
+    # No categorical columns at customer level after aggregation
+    pipeline = build_preprocessing_pipeline(numerical_cols, [])
+    X = feature_df[numerical_cols]
+    X_transformed = pipeline.fit_transform(X)
+    print(f"\nPreprocessed feature matrix shape: {X_transformed.shape}")
+    print("Pipeline fitted successfully.")
